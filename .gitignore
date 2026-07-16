@@ -1,0 +1,31 @@
+# 1. 编译输出目录 (绝对不能传！)
+build/
+install/
+log/
+logs/
+
+# 2. CMake 缓存文件
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+*.cmake
+
+# 3. 编辑器配置与系统临时文件
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# 4. 可执行文件与动态库
+*.o
+*.a
+*.so
+optimizer
+
+# 5. 模型文件 (如果你模型文件很大，也可以在这行下面列出排除，但一般建议保留)
+# 只要不大于 50MB-100MB 都可以传，如果很大，请考虑使用 Git LFS
+
+# 6. 数据 (如果你不希望把几十G的 rosbag 传上去)
+data/

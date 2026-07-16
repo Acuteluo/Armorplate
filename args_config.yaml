@@ -1,0 +1,16 @@
+%YAML:1.0
+---
+
+# yolo 模型路径设置
+YoloModel:
+  Path: "../model/0526.onnx"
+
+# camera_config.yaml 路径设置
+CameraConfig:
+  Path: "../camera_config.yaml"
+
+# rosbag 配置
+Rosbag:
+  Path: "../data/final-1/rosbag2_2026_06_27-15_54_16/rosbag2_2026_06_27-15_54_16_0.db3"
+  Topic: "/image_raw"
+  
