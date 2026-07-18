@@ -18,6 +18,7 @@
 #include "tools/math_utils.hpp"
 #include "yolo/yolo_detector.hpp"
 #include "yolo/yolo_armor.hpp"
+#include "armor_corner_refiner.hpp"
 
 // ================= 全局共享数据与锁 =================
 struct SharedData 
@@ -198,6 +199,9 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
     int frame_count = 0;
     auto fps_start_time = std::chrono::steady_clock::now();
 
+    // 【新增】：实例化角点精化器
+    ArmorCornerRefiner corner_refiner;
+
     while (g_running) 
     {
         {
@@ -223,20 +227,30 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
             auto t1 = std::chrono::steady_clock::now();
             
             // 3. 姿态解算：PnP 与 网格搜索姿态优化
-            for (const auto& obj : detections) 
+            for (auto& obj : detections) 
             {
+                std::vector<cv::Point2f> pts = obj.pts;
+                bool refine_success = corner_refiner.Refine(process_frame, obj.pts, obj.color);
+                
+                if (!refine_success) 
+                {
+                    LOG_WARN("[Refiner] 角点精化失败，降级使用 YOLO 原始角点");
+                    // 即使精化失败，obj.pts 仍保留原样，不会崩溃，系统具有鲁棒性
+                }
+
                 // 将从 YAML 动态读取的内参传入 Armor 对象
                 YoloArmor armor(obj.number, obj.color, obj.is_big, obj.prob, obj.box, obj.pts, K, D);
                 armor.SetArmorplateSize();
                 armor.PrintDebugLog(false); // 关闭刷屏打印
                 
-                // 执行解算 (当前内部包含暴力的 SearchOptimalEulerYaw)
+                // 执行解算 PNP IPPE
                 armor.PNP(); 
 
                 // 画出解算结果
                 if (armor.pnp_success_) 
                 {
-                    armor.DrawAndPrintInfo(process_frame, "complex");
+                    armor.CalculateReprojectionError(armor.t_flu_, armor.R_flu_); // 计算原始 pnp 的重投影误差
+                    armor.DrawAndPrintInfo(process_frame, "complex", pts);
                 }
             }
             auto t2 = std::chrono::steady_clock::now();
@@ -255,7 +269,7 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
             auto fps_current_time = std::chrono::steady_clock::now();
             double elapsed_seconds = std::chrono::duration<double>(fps_current_time - fps_start_time).count();
             
-            if (elapsed_seconds >= 1.0) 
+            if (elapsed_seconds >= 0.50) 
             {
                 double fps = frame_count / elapsed_seconds;
                 // 这行日志是我们最关注的算法耗时评估指标！
@@ -263,6 +277,10 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
                 frame_count = 0;
                 fps_start_time = fps_current_time;
             }
+
+            // 【新增 可逆 控制速度】：真正的全局控速阀门！
+            // 让视觉线程处理完后休息 30ms。由于 A 和 B 是锁步的，这会强制让整个 Rosbag 的读取速度降到约 30fps，且绝不漏帧！
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); 
         }
     }
 }
@@ -320,11 +338,21 @@ int main(int argc, char** argv)
         if (!show_frame.empty()) 
         {
             cv::imshow("ACE Vision - Optimization Test", show_frame);
+
+            // std::vector<cv::Mat> bgr;
+            // cv::split(show_frame, bgr);
+
+            // cv::Mat blue  = bgr[0];   // 蓝通道
+            // cv::Mat green = bgr[1];
+            // cv::Mat red   = bgr[2];   // 红通道
+
+            // // 显示
+            // cv::imshow("Blue Channel", blue);
+            // cv::imshow("Red Channel", red);
             
-            // 【核心视觉观感控制】：用 waitKey 的延时来控制视频的播放速度！
-            // 因为我们的拉流和视觉处理是“锁步不漏帧”的，如果这里设 1ms，视频会像快进一样飞速播完。
-            // 设 30ms，大约肉眼看起来就是 30fps 的舒适观感。
-            char key = (char)cv::waitKey(30); 
+            // waitKey(1) 仅用于刷新 OpenCV 的 GUI 缓冲区和监听键盘事件。
+            // 因为真正的画面更新频率已经被 VisionThread 里的 sleep 限制死了，所以这里的 1 只是保证画面极度流畅，不会产生抽帧。
+            char key = (char)cv::waitKey(1); 
             if (key == 27 || key == 'q' || key == 'Q') 
             {
                 LOG_WARN("收到退出指令...");

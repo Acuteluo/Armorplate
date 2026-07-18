@@ -43,6 +43,8 @@ add_executable(optimizer
     src/yolo/yolo_armor.cpp
     src/yolo/yolo_detector.cpp
     src/tools/logger.cpp
+    src/tools/math_utils.cpp
+    src/armor_corner_refiner.cpp
 )
 
 # 链接库
