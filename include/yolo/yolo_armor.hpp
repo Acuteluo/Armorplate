@@ -13,37 +13,45 @@ public:
 
     YoloArmor();
 
-    YoloArmor(int armor_id, int color, bool is_big, float confidence, const cv::Rect& box, const std::vector<cv::Point2f>& corners, const cv::Mat& K, const cv::Mat& D);
+    YoloArmor(int armor_id, int color, bool is_big, float confidence, const cv::Rect& box, const std::vector<cv::Point2f>& corners, const std::vector<cv::Point2f>& fixed_corners, const cv::Mat& K, const cv::Mat& D);
 
     ~YoloArmor() = default;
 
     // --- Yolo 得到的装甲板的基础属性 ---
+
     int armor_id_;                     // 编号 (1~8)
     int color_;                        // 颜色 (0:红, 1:蓝, 2:灰, 3:紫)
     bool is_big_;                      // 大小板标志 (true: 大板, false: 小板)
     float confidence_;                 // 置信度
-    cv::Rect box_;                     // 2D 边界框
-    std::vector<cv::Point2f> corners_; // 2D 像素角点 (左上, 左下, 右下, 右上)
+    cv::Rect box_;                     // 2D 原始边界框
+    std::vector<cv::Point2f> corners_;       // 2D 原始像素角点 (左上, 左下, 右下, 右上)
+    std::vector<cv::Point2f> fixed_corners_; // 2D 修正像素角点 (左上, 左下, 右下, 右上)
 
     bool pnp_success_ = false;         // PnP 解算是否成功
 
+
     // --- 姿态与位置 (FLU 统一右手系！) ---
+
     Eigen::Vector3d t_flu_;            // 平移向量，在 FLU 系下 (x向前, y向左, z向上)
     Eigen::Matrix3d R_flu_;            // 旋转矩阵，在 FLU 系下
     
-    double t_distance_;                // 距离相机中心距离 (米)
+    double t_distance_;                // 相机到装甲板中心的距离 (米)
 
     double yaw_angle_ = 0.00;          // 优化得到的最好的 欧拉角 yaw（度）
 
+
     // --- 相机内参 ---
+
     cv::Mat K_;                        // 内参矩阵
     cv::Mat D_;                        // 畸变系数
 
+
     // --- 核心方法 ---
+
     // 根据 YOLO 判断的大/小板设置装甲板四个角点的坐标，并将 FLU 系的点转换到 OpenCV 系下供 PnP 使用
     void SetArmorplateSize();
 
-    // 原始的执行 PnP IPPE 解算，并完成逆向基变换 (OpenCV -> FLU)
+    // 原始的执行 PNP IPPE 解算，并完成逆向基变换 (OpenCV -> FLU)
     void PNP();
 
     // 计算重投影误差 (RMSE)，传入 FLU 坐标系下的平移向量和旋转矩阵
@@ -51,7 +59,14 @@ public:
 
     // --- 可视化方法 ---
     // 在图像上画框并打印信息，模式 "simple" / "complex" 仅输出框 / 打印所有信息
-    void DrawAndPrintInfo(cv::Mat& img_show, std::string mode_select, std::vector<cv::Point2f> pts = {});
+    cv::Mat DrawAndPrintInfo(const cv::Mat& original_img, std::string mode_select);
+
+    // 新增：局部放大亚像素渲染函数，把精化器吐出的点集全部画出来
+    cv::Mat DrawMagnifiedROI(const cv::Mat& original_img, 
+                             const cv::Vec4f& left_middle_line, 
+                             const cv::Vec4f& right_middle_line,
+                             const std::vector<std::vector<cv::Point2f>>& debug_pts,
+                             int scale = 10);
 
     // 打印调试日志
     void PrintDebugLog(bool is_debug);

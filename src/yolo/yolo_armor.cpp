@@ -16,8 +16,8 @@ YoloArmor::YoloArmor()
 }
 
 
-YoloArmor::YoloArmor(int armor_id, int color, bool is_big, float confidence,
-                     const cv::Rect& box, const std::vector<cv::Point2f>& corners,
+YoloArmor::YoloArmor(int armor_id, int color, bool is_big, float confidence, const cv::Rect& box, 
+                     const std::vector<cv::Point2f>& corners, const std::vector<cv::Point2f>& fixed_corners,
                      const cv::Mat& K, const cv::Mat& D)
     : armor_id_(armor_id),
       color_(color),
@@ -25,6 +25,7 @@ YoloArmor::YoloArmor(int armor_id, int color, bool is_big, float confidence,
       confidence_(confidence),
       box_(box),
       corners_(corners),
+      fixed_corners_(fixed_corners),
       pnp_success_(false),  
       t_distance_(0.0),
       K_(K),        
@@ -168,8 +169,10 @@ double YoloArmor::CalculateReprojectionError(const Eigen::Vector3d& t_flu, const
 
 
 // 在图像上画框并打印信息，模式 "simple" / "complex" 仅输出框 / 打印所有信息
-void YoloArmor::DrawAndPrintInfo(cv::Mat& img_show, std::string mode_select, std::vector<cv::Point2f> pts)
+cv::Mat YoloArmor::DrawAndPrintInfo(const cv::Mat& original_img, std::string mode_select)
 {
+    cv::Mat img_show = original_img.clone();
+
     // 1. 画框与四个角点
     cv::Scalar edge_color = cv::Scalar(235, 206, 135); 
     for (int i = 0; i < 4; i++) 
@@ -177,13 +180,10 @@ void YoloArmor::DrawAndPrintInfo(cv::Mat& img_show, std::string mode_select, std
         // cv::line(img_show, corners_[i], corners_[(i + 1) % 4], edge_color, 2);
 
         // 原始角点所在像素变成蓝色 
-        if (pts.size() > 0)
-        {
-            cv::circle(img_show, pts[i], 0.01, cv::Scalar(255, 0, 0), cv::FILLED);
-        }
+        cv::circle(img_show, corners_[i], 0.01, cv::Scalar(255, 0, 0), cv::FILLED);
 
-        // 把角点所在像素变成绿色
-        cv::circle(img_show, corners_[i], 0.01, cv::Scalar(0, 255, 0), cv::FILLED);
+        // 精化角点所在像素变成绿色
+        cv::circle(img_show, fixed_corners_[i], 0.01, cv::Scalar(0, 255, 0), cv::FILLED);
 
         // 画角点序号，方便验证顺序 (0左上, 1左下, 2右下, 3右上)
         // cv::putText(img_show, std::to_string(i), corners_[i], cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 128, 255), 2);
@@ -194,7 +194,7 @@ void YoloArmor::DrawAndPrintInfo(cv::Mat& img_show, std::string mode_select, std
     cv::circle(img_show, center, 3, cv::Scalar(0, 0, 255), cv::FILLED);
 
     // 3. 打印 RMSE
-    cv::putText(img_show, "RMSE: " + std::to_string(reprojection_error_).substr(0, 6), cv::Point2f(20.00, 20.00), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 255, 255), 2);
+    cv::putText(img_show, "RMSE: " + std::to_string(reprojection_error_).substr(0, 6), cv::Point2f(30.00, 30.00), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 255, 255), 2);
 
     // complex 模式下打印完整信息
     if (mode_select == "complex")
@@ -215,6 +215,123 @@ void YoloArmor::DrawAndPrintInfo(cv::Mat& img_show, std::string mode_select, std
         cv::putText(img_show, "COLOR:" + std::to_string(color_str), cv::Point2f(box_.x, box_.y + box_.height + 40), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
         cv::putText(img_show, info_yaw, cv::Point2f(box_.x, box_.y + box_.height + 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
     }
+
+    return img_show;
+}
+
+
+cv::Mat YoloArmor::DrawMagnifiedROI(const cv::Mat& original_img, 
+                                    const cv::Vec4f& left_middle_line, 
+                                    const cv::Vec4f& right_middle_line,
+                                    const std::vector<std::vector<cv::Point2f>>& debug_pts,
+                                    int scale)
+{
+    // 1. 根据 YOLO 框扩大 ROI 范围 (扩大 15 像素以容纳周围背景)
+    int expand = 15;
+    cv::Rect roi = box_;
+    roi.x -= expand; 
+    roi.y -= expand;
+    roi.width += 2 * expand; 
+    roi.height += 2 * expand;
+    
+    // 增加边界判断的裁剪 roi，防止越界
+    roi.x = std::max(0, roi.x);
+    roi.y = std::max(0, roi.y);
+    roi.width = std::min(original_img.cols - roi.x, roi.width);
+    roi.height = std::min(original_img.rows - roi.y, roi.height);
+    if (roi.width <= 0 || roi.height <= 0) 
+    {
+        return cv::Mat();
+    }
+
+
+    // 2. 将 roi 图像 cropped，长宽各放大到原来的 scale 倍，结果输出到 magnified 中，并且缩放时采用“最近邻插值”算法
+    cv::Mat cropped = original_img(roi);
+    cv::Mat magnified;
+    cv::resize(cropped, magnified, cv::Size(), scale, scale, cv::INTER_NEAREST);
+
+    // 绘制灰色细线网格，清晰看到原图的每一个像素块
+    for (int i = 0; i <= magnified.cols; i += scale) 
+    {
+        cv::line(magnified, cv::Point(i, 0), cv::Point(i, magnified.rows), cv::Scalar(50, 50, 50), 1);
+    }
+    for (int i = 0; i <= magnified.rows; i += scale) 
+    {
+        cv::line(magnified, cv::Point(0, i), cv::Point(magnified.cols, i), cv::Scalar(50, 50, 50), 1);
+    }
+
+    // 内部 Lambda 工具：将原图亚像素坐标映射到放大图的整型坐标上
+    // opencv定义是像素块中心是整数坐标。但为了符合肉眼直觉，向右偏移 0.5 像素，这样边界线是整数坐标，像素块中心是.5坐标
+    auto map_pt = [&](const cv::Point2f& p) {
+        return cv::Point2f(std::round((p.x - roi.x + 0.5f) * scale), 
+                           std::round((p.y - roi.y + 0.5f) * scale));
+    };
+
+    // 内部 Lambda 工具：在放大图上画射线
+    auto draw_axis_line = [&](const cv::Vec4f& line_eq, cv::Scalar color) {
+        if (line_eq[0] == 0 && line_eq[1] == 0) 
+        {
+            return; // 无效直线
+        }
+        cv::Point2f v(line_eq[0], line_eq[1]);
+        cv::Point2f p0(line_eq[2], line_eq[3]);
+
+        // 沿向量向上下各延伸 30 个像素画线
+        cv::Point2f p1 = p0 - v * 30.0f; 
+        cv::Point2f p2 = p0 + v * 30.0f;
+        cv::line(magnified, map_pt(p1), map_pt(p2), color, 2);
+    };
+
+
+    // 3. 画出 RANSAC 拟合出的灯条中轴线 (黄色)
+    draw_axis_line(left_middle_line, cv::Scalar(0, 255, 255));
+    draw_axis_line(right_middle_line, cv::Scalar(0, 255, 255));
+
+    // ==============================================================
+    // 渲染每一层的提取点，作为强力的对齐查错手段！
+    auto draw_cross = [&](const cv::Point2f& pt, cv::Scalar color, int size) {
+        cv::Point2f mapped = map_pt(pt);
+        // 画十字
+        // cv::line(magnified, cv::Point(mapped.x - size, mapped.y), cv::Point(mapped.x + size, mapped.y), color, 1);
+        // cv::line(magnified, cv::Point(mapped.x, mapped.y - size), cv::Point(mapped.x, mapped.y + size), color, 1);
+    
+        // 直接画点
+        cv::circle(magnified, mapped, size, color, cv::FILLED);
+    };
+
+    // 4. 画出 Debug 角点，顺序：左边缘、右边缘、中点
+    if(debug_pts.size() == 6) 
+    {
+        // 左灯条边缘与中心：左粉，右橙，中白
+        for(auto& p : debug_pts[0]) draw_cross(p, cv::Scalar(255, 0, 255), scale/4); 
+        for(auto& p : debug_pts[1]) draw_cross(p, cv::Scalar(0, 165, 255), scale/4); 
+        for(auto& p : debug_pts[2]) draw_cross(p, cv::Scalar(255, 255, 255), scale/4); 
+        
+        // 右灯条边缘与中心：左粉，右橙，中白
+        for(auto& p : debug_pts[3]) draw_cross(p, cv::Scalar(255, 0, 255), scale/4); 
+        for(auto& p : debug_pts[4]) draw_cross(p, cv::Scalar(0, 165, 255), scale/4); 
+        for(auto& p : debug_pts[5]) draw_cross(p, cv::Scalar(255, 255, 255), scale/4); 
+    }
+    // ==============================================================
+
+
+    // 5. 画出原始的 YOLO 粗糙角点 (蓝色实心大圆)
+    for (const auto& pt : corners_) 
+    {
+        cv::circle(magnified, map_pt(pt), scale / 2, cv::Scalar(255, 0, 0), cv::FILLED);
+    }
+
+
+    // 6. 画出我们的高精度亚像素修正角点 (绿色实心小圆)
+    // 你会清楚地看到绿点偏离蓝点，稳稳地落在黄色直线上，并且精准卡在灯条尽头的网格内！
+    for (const auto& pt : fixed_corners_) 
+    {
+        cv::circle(magnified, map_pt(pt), scale / 3, cv::Scalar(0, 255, 0), cv::FILLED);
+    }
+        
+
+    // 7. 回传 magnified 图
+    return magnified;
 }
 
 

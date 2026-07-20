@@ -5,12 +5,12 @@
 
 namespace tools
 {
-bool fitLineRANSAC(const std::vector<cv::Point2f>& points, cv::Vec4f& line, int iterations, float distance_thresh)
+int fitLineRANSAC(const std::vector<cv::Point2f>& points, cv::Vec4f& line, int iterations, float distance_thresh)
 {
     // ransac 确保点数足够
     if (points.size() < 2) 
     {
-        return false;
+        return 0; // 返回 0 表示失败
     }
 
     // 如果只有两个点，直接连线即可
@@ -18,12 +18,12 @@ bool fitLineRANSAC(const std::vector<cv::Point2f>& points, cv::Vec4f& line, int 
     {
         cv::Point2f v = points[1] - points[0];
         float length = (float)cv::norm(v);
-        if (length < 1e-5) 
+        if (length < 1e-5) // 线段太短
         {
-            return false;
+            return 0;
         }
         line = cv::Vec4f(v.x / length, v.y / length, points[0].x, points[0].y);
-        return true;
+        return 2; // 两个点都是内点，权重为 2
     }
 
     // 1. 初始化随机数发生器
@@ -83,7 +83,7 @@ bool fitLineRANSAC(const std::vector<cv::Point2f>& points, cv::Vec4f& line, int 
     // 内点太少，说明拟合失败
     if (best_inlier_count < 2) 
     {
-        return false;
+        return 0;
     }
 
 
@@ -124,7 +124,8 @@ bool fitLineRANSAC(const std::vector<cv::Point2f>& points, cv::Vec4f& line, int 
     // 将直线结果打包输出 [vx, vy, x0, y0]
     line = cv::Vec4f(vx, vy, centroid.x, centroid.y);
 
-    return true;
+    // 返回寻找到的绝对内点数量，作为后续加权的物理置信度
+    return best_inlier_count;
 }
 
 } // namespace tools

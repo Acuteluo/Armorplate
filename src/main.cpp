@@ -25,6 +25,7 @@ struct SharedData
 {
     cv::Mat current_frame;         // 拉流线程写入：刚从 rosbag 取出的原图
     cv::Mat display_frame;         // 视觉线程写入：画好框和打印好数据的渲染图
+    cv::Mat refined_frame;         // 视觉线程写入：经过亚像素角点修正的放大图
     bool frame_updated = false;    // 标志位：是否有新图
 };
 
@@ -221,6 +222,9 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
 
         if (!process_frame.empty()) 
         {
+            cv::Mat img_show = {};
+            cv::Mat img_refined = {};
+
             // 2. YOLO 推理 (计时开始)
             auto t0 = std::chrono::steady_clock::now();
             std::vector<YoloObject> detections = detector->Detect(process_frame, ENEMY_COLOR);
@@ -229,8 +233,9 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
             // 3. 姿态解算：PnP 与 网格搜索姿态优化
             for (auto& obj : detections) 
             {
-                std::vector<cv::Point2f> pts = obj.pts;
-                bool refine_success = corner_refiner.Refine(process_frame, obj.pts, obj.color);
+                std::vector<cv::Point2f> original_corners = obj.pts;
+                cv::Vec4f left_middle_line(0,0,0,0), right_middle_line(0,0,0,0); // 存储左、右线
+                bool refine_success = corner_refiner.Refine(process_frame, obj.pts, obj.color, left_middle_line, right_middle_line);
                 
                 if (!refine_success) 
                 {
@@ -238,27 +243,34 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
                     // 即使精化失败，obj.pts 仍保留原样，不会崩溃，系统具有鲁棒性
                 }
 
-                // 将从 YAML 动态读取的内参传入 Armor 对象
-                YoloArmor armor(obj.number, obj.color, obj.is_big, obj.prob, obj.box, obj.pts, K, D);
+                // 将从 YAML 动态读取的内参传入 Armor 对象，先传入原始点后传入精化后的点
+                YoloArmor armor(obj.number, obj.color, obj.is_big, obj.prob, obj.box, original_corners, obj.pts, K, D);
                 armor.SetArmorplateSize();
                 armor.PrintDebugLog(false); // 关闭刷屏打印
                 
-                // 执行解算 PNP IPPE
+                // 对原始点，执行解算 PNP IPPE
                 armor.PNP(); 
 
                 // 画出解算结果
                 if (armor.pnp_success_) 
                 {
                     armor.CalculateReprojectionError(armor.t_flu_, armor.R_flu_); // 计算原始 pnp 的重投影误差
-                    armor.DrawAndPrintInfo(process_frame, "complex", pts);
+                    
+                    // 亚像素图，放大 30 倍！
+                    img_refined = armor.DrawMagnifiedROI(process_frame, left_middle_line, right_middle_line, corner_refiner.GetDebugPoints(), 30);
+                
+                    img_show = armor.DrawAndPrintInfo(process_frame, "complex");
                 }
+
+                    
             }
             auto t2 = std::chrono::steady_clock::now();
 
             // 4. 将画好各种框和文字的图片，传回给主线程去渲染显示
             {
                 std::lock_guard<std::mutex> lock(g_mtx);
-                g_data.display_frame = process_frame.clone();
+                g_data.display_frame = img_show.clone();
+                g_data.refined_frame = img_refined.clone();
             }
 
             // 5. 耗时与 FPS 统计 (每隔 1 秒打印一次，防止刷屏)
@@ -280,7 +292,7 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
 
             // 【新增 可逆 控制速度】：真正的全局控速阀门！
             // 让视觉线程处理完后休息 30ms。由于 A 和 B 是锁步的，这会强制让整个 Rosbag 的读取速度降到约 30fps，且绝不漏帧！
-            std::this_thread::sleep_for(std::chrono::milliseconds(100)); 
+            std::this_thread::sleep_for(std::chrono::milliseconds(500)); 
         }
     }
 }
@@ -324,20 +336,23 @@ int main(int argc, char** argv)
     // 6. UI 显示主循环
     while (g_running) 
     {
-        cv::Mat show_frame;
+        cv::Mat show_frame_display;
+        cv::Mat show_frame_refined;
 
         {
             // 安全地从共享内存获取渲染图
             std::lock_guard<std::mutex> lock(g_mtx);
             if (!g_data.display_frame.empty()) 
             {
-                show_frame = g_data.display_frame.clone();
+                show_frame_display = g_data.display_frame.clone();
+                show_frame_refined = g_data.refined_frame.clone();
             }
         }
 
-        if (!show_frame.empty()) 
+        if (!show_frame_display.empty()) 
         {
-            cv::imshow("ACE Vision - Optimization Test", show_frame);
+            cv::imshow("ACE Vision - Optimization Test", show_frame_display);
+            cv::imshow("Refined", show_frame_refined);
 
             // std::vector<cv::Mat> bgr;
             // cv::split(show_frame, bgr);
@@ -359,6 +374,10 @@ int main(int argc, char** argv)
                 g_running = false;
                 g_cv.notify_all(); // 叫醒所有还在 wait 的线程
                 break;
+            }
+            else if (key == ' ')
+            {
+                char wait_key = (char)cv::waitKey(10000000);
             }
         }
         else

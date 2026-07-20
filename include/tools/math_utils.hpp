@@ -48,9 +48,9 @@ inline double limit_rad(double rad)
  * @param line             输出的直线参数，格式为 [vx, vy, x0, y0] (vx vy 单位方向向量，x0 y0 线上一点)
  * @param iterations       RANSAC 最大迭代次数
  * @param distance_thresh  判定为内点的最大距离阈值 (像素)
- * @return true 拟合成功, false 拟合失败(有效点数过少)
+ * @return 拟合成功的内点数量 (若小于2则视为失败，返回 0)
  */
-bool fitLineRANSAC(const std::vector<cv::Point2f>& points, cv::Vec4f& line, 
+int fitLineRANSAC(const std::vector<cv::Point2f>& points, cv::Vec4f& line, 
                    int iterations = 100, float distance_thresh = 1.0f);
 
 } // namespace tools

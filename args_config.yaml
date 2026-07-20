@@ -10,6 +10,7 @@ CameraConfig:
   Path: "../camera_config.yaml"
 
 # rosbag 配置
+# 1=原地旋转 2=静止
 Rosbag:
   Path: "../data/final-1/rosbag2_2026_06_27-15_54_16/rosbag2_2026_06_27-15_54_16_0.db3"
   # Path: "../data/final-1/rosbag2_2026_06_27-15_57_58/rosbag2_2026_06_27-15_57_58_0.db3"
