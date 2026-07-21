@@ -256,8 +256,8 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
                 {
                     armor.CalculateReprojectionError(armor.t_flu_, armor.R_flu_); // 计算原始 pnp 的重投影误差
                     
-                    // 亚像素图，放大 30 倍！
-                    img_refined = armor.DrawMagnifiedROI(process_frame, left_middle_line, right_middle_line, corner_refiner.GetDebugPoints(), 30);
+                    // 亚像素图，放大 40 倍！
+                    img_refined = armor.DrawMagnifiedROI(process_frame, left_middle_line, right_middle_line, corner_refiner.GetDebugPoints(), 40);
                 
                     img_show = armor.DrawAndPrintInfo(process_frame, "complex");
                 }
@@ -377,6 +377,7 @@ int main(int argc, char** argv)
             }
             else if (key == ' ')
             {
+                g_running = false;
                 char wait_key = (char)cv::waitKey(10000000);
             }
         }

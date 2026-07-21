@@ -56,7 +56,7 @@ private:
 
 
     // 对于某个灯条 上 / 下 端点，优化端点位置的函数
-    cv::Point2f SearchExactEndpoint(const cv::Mat& gray_img, 
+    cv::Point2f SearchExactEndpoint(const cv::Mat& gray_img,
                                     const cv::Vec4f& exact_line, 
                                     const cv::Point2f& rough_pt, 
                                     bool is_top_point,

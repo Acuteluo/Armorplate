@@ -159,7 +159,7 @@ bool ArmorCornerRefiner::ScanAndFit(const cv::Mat& gray_img,
         float max_val = 0.0f;
         int max_idx = -1;
         
-        std::cout << std::endl << "第 " << k << " 个点" << std::endl << "一维离散信号：" << std::endl;
+        // std::cout << std::endl << "第 " << k << " 个点" << std::endl << "一维离散信号：" << std::endl;
         for (int offset = -W_int; offset <= W_int; offset++) 
         {
             cv::Point2f p = k_initial_center + offset * n;
@@ -178,9 +178,9 @@ bool ArmorCornerRefiner::ScanAndFit(const cv::Mat& gray_img,
                 min_val = val; 
             }
 
-            std::cout << profile[offset + W_int] << " ";
+            // std::cout << profile[offset + W_int] << " ";
         }
-        std::cout << "极值索引：" << max_idx << " 极值：" << max_val << " 极小值：" << min_val << std::endl;
+        // std::cout << "极值索引：" << max_idx << " 极值：" << max_val << " 极小值：" << min_val << std::endl;
         
 
         // 2. 如果对比度足够 (保底 25.0f)，极值索引有效，才进行边缘提取，过滤纯黑底噪
@@ -215,7 +215,7 @@ bool ArmorCornerRefiner::ScanAndFit(const cv::Mat& gray_img,
                     break;
                 }
             }
-            std::cout << "左边缘索引: " << left_idx << " 右边缘索引: " << right_idx << std::endl;
+            // std::cout << "左边缘索引: " << left_idx << " 右边缘索引: " << right_idx << std::endl;
         
             // 严格配对中点，只有左右双峰同时存在且有效时，才配对求取中点！天然抵消对称膨胀误差！
             if (left_idx >= 0.0f && right_idx >= 0.0f)
@@ -224,7 +224,7 @@ bool ArmorCornerRefiner::ScanAndFit(const cv::Mat& gray_img,
                 cv::Point2f pt_l = k_initial_center + (left_idx - W_int) * n;
                 cv::Point2f pt_r = k_initial_center + (right_idx - W_int) * n;
                 cv::Point2f pt_c = (pt_l + pt_r) * 0.5f; // 两个边缘点的中点视为中轴线点
-                std::cout << "左偏移修正left_idx - W_int: " << left_idx - W_int << " 右偏移修正right_idx - W_int: " << right_idx - W_int << std::endl; 
+                // std::cout << "左偏移修正left_idx - W_int: " << left_idx - W_int << " 右偏移修正right_idx - W_int: " << right_idx - W_int << std::endl; 
 
                 // 存储每一对左边缘点、右边缘点、中轴线点
                 out_left_edges.push_back(pt_l);
@@ -254,7 +254,6 @@ bool ArmorCornerRefiner::ScanAndFit(const cv::Mat& gray_img,
     return inliers >= 4;
 }
 
-
 // 对于某个灯条 上 / 下 端点，优化端点位置的函数
 cv::Point2f ArmorCornerRefiner::SearchExactEndpoint(const cv::Mat& gray_img, 
                                                     const cv::Vec4f& exact_line, 
@@ -262,110 +261,125 @@ cv::Point2f ArmorCornerRefiner::SearchExactEndpoint(const cv::Mat& gray_img,
                                                     bool is_top_point,
                                                     float bar_length)
 {
-    // 1. 将粗端点投影到已经拟合好的纯净中轴线上，作为搜索基准
-    cv::Point2f v(exact_line[0], exact_line[1]);    // 直线单位方向向量
-    cv::Point2f p0(exact_line[2], exact_line[3]);   // 直线上基准点
+    cv::Point2f v(exact_line[0], exact_line[1]);    
+    cv::Point2f p0(exact_line[2], exact_line[3]);   
     
-    // 向量点乘求投影参数 t
     float t_proj = (rough_pt.x - p0.x) * v.x + (rough_pt.y - p0.y) * v.y;
-    cv::Point2f project_pt = p0 + t_proj * v; // 投影点
+    cv::Point2f project_pt = p0 + t_proj * v; 
 
-    // 规范方向，v 从上到下，n 从左到右 
     if (v.y < 0) v = -v; 
-    cv::Point2f n(v.y, -v.x); // 法向，用于横向提取小带状区域
+    cv::Point2f n(v.y, -v.x); 
 
-    // 动态防重叠搜索半径（以端点为中心点的沿轴线搜索半径），最大不超过设定值，且绝不超过灯条长度的 50%！
-    int R = std::min((int)endpoint_search_R_, std::max(4, (int)(bar_length * 0.50f)));
+    int R = std::min((int)endpoint_search_R_, std::max(4, (int)(bar_length * 0.75f)));
+    std::cout << "is_top_point: " << is_top_point << " bar_length: " << bar_length << std::endl;
+    std::cout << std::endl << "R: " << R << std::endl;
 
-    // 2. 构建一维以端点为中心，横向宽度为 3，从上往下的垂直搜索的滑动窗口平均亮度信号，并记录极值索引
-    int search_len = R * 2 + 1; // 搜索窗口长度 
-    std::vector<float> signal(search_len, 0.0f); // 存储亮度信号，从上到下
+    // 【架构跃迁：定义绝对向内的行进向量】
+    // 上端点向内是 v(向下)；下端点向内是 -v(向上)。
+    // 这样，我们的探测车永远只朝向灯条核心开！
+    cv::Point2f scan_dir = is_top_point ? v : -v;
 
-    // 依旧找到剖面的最小、最大值，也要记录极值索引
-    float min_val = 255.0f;
+    // 扫描深度：从外部背景 (-R) 一直深入到灯条的绝对物理正中心 (bar_length * 0.5)！
+    // 这保证了我们提取到的 max_val 百分之百是整个灯条的核心最高亮，不再被外部小土包骗！
+    int inner_dist = std::max((int)(bar_length * 0.5f), R);
+    int search_len = R + inner_dist + 1; 
+    std::vector<float> signal(search_len, 0.0f); 
+
     float max_val = 0.0f;
     int max_idx = -1;
     
     for (int i = 0; i < search_len; i++)
     {
-        // 从投影点开始，沿修正后的中轴线方向步进，步长 1 像素 (从 -R 到 +R)
+        // 索引 0 永远代表外部背景(-R)。索引越大，越深入灯条腹地。
         float step = (i - R) * 1.0f; 
-        cv::Point2f current_p = project_pt + step * v; // 当前点所在位置
+        cv::Point2f current_p = project_pt + step * scan_dir; 
+        if (i - R == 0) std::cout << "投影点=";
 
-        // 横向平均提取法 (Width=3)
-        float sum_value = 0.0f;
-        sum_value += BilinearInterpolation(gray_img, current_p.x - 1.0f * n.x, current_p.y - 1.0f * n.y); // 当前点沿法线方向，朝左一步
-        sum_value += BilinearInterpolation(gray_img, current_p.x,              current_p.y);              // 当前点
-        sum_value += BilinearInterpolation(gray_img, current_p.x + 1.0f * n.x, current_p.y + 1.0f * n.y); // 当前点沿法线方向，朝右一步
+        // 横向取最大值，防细灯条微偏
+        float left = BilinearInterpolation(gray_img, current_p.x - 0.5f * n.x, current_p.y - 0.5f * n.y); 
+        float middle = BilinearInterpolation(gray_img, current_p.x,              current_p.y);              
+        float right = BilinearInterpolation(gray_img, current_p.x + 0.5f * n.x, current_p.y + 0.5f * n.y); 
         
-        signal[i] = sum_value / 3.0f; // 取平均作为该点的亮度
+        signal[i] = std::max(left, std::max(middle, right)); 
+        std::cout << signal[i] << " ";
 
-        // 锁定局部最高峰(发光核心)和最低谷(背景底噪)
         if (signal[i] > max_val) 
         {
             max_val = signal[i];
             max_idx = i;
         }
-        if (signal[i] < min_val) 
-        {
-            min_val = signal[i];
-        }
     }
+    std::cout << std::endl << "max_val: " << max_val << " max_idx: " << max_idx << " position: " << project_pt + (max_idx - R) * scan_dir << std::endl;
 
-    float sub_offset = 0.0f; // 相对于窗口中心的亚像素偏移
+    float sub_offset = 0.0f; 
     bool found = false;
 
-    // 3. 由内向外扫描，寻找首次跌破阈值的下降沿
-    // 保底：如果明暗对比太弱，说明灯条完全不可见，退回投影点
-    if (max_val - min_val > 25.0f && max_idx > 0 && max_idx < search_len - 1)
-    {
-        // 0.50 是纯物理半高宽；0.60 偏内侧(主色调)
-        // 相对阈值计算，完美免疫底噪环境光！
-        float thresh = min_val + (max_val - min_val) * 0.6f;
+    // 获取绝对真实的外部背景底噪 (因为无论上下端点，索引 0~2 必然在灯条外最远侧)
+    float bg_val = (signal[0] + signal[1] + signal[2]) / 3.0f; // todo：背景不对！小心找高了！
+    std::cout << "bg_val: " << bg_val << std::endl;
 
-        if (is_top_point) 
+    // 只有当核心亮度高于背景时才执行，防误切纯黑区域
+    if (max_val - bg_val > 25.0f && max_idx > 0)
+    {
+        // 核心：背景底噪 + 真实跳变落差的 25%
+        // 并用硬编码的 +25.0f 亮度抬升作为保底，彻底杜绝掉入纯黑底噪中！
+        float dynamic_thresh = bg_val + (max_val - bg_val) * 0.25f;
+        float thresh = std::max(dynamic_thresh, bg_val + 25.0f);
+        std::cout << "thresh: " << thresh << std::endl;
+
+        // 【唯一且无脑的平推】：永远从外部(索引0)出发，保险起见驶向终点
+        for (int i = 0; i < search_len - 1; i++)
         {
-            // 上端点：图像上方是外侧(小索引)。
-            // 【由外向内推】：从 0 往中间走，寻找首次跨越阈值的点
-            for (int i = 0; i < search_len - 1; i++)
+            // 当探测车第一次撞到 20% 的绝壁时，踩死刹车！
+            // 因为是从外往内走，它彻底免疫了山峰后面的各种陨石坑和过曝区域！
+            if (signal[i] <= thresh && signal[i+1] > thresh) 
             {
-                // 当前点还在阈值之下，但下一个点（更内侧）已经超过阈值
-                if (signal[i] <= thresh && signal[i+1] > thresh) 
+                // 前瞻精修，寻找附近真正的峭壁
+                int best_i = i;
+                float max_grad = signal[i+1] - signal[i];
+                int max_lookahead = 3; // 短时间连续上升才行，最多往里看 3 步
+
+                for (int k = 1; k <= max_lookahead; k++) 
                 {
-                    // 线性插值亚像素偏移，精确算出穿越 thresh 的浮点位置
-                    float t = (thresh - signal[i]) / (signal[i+1] - signal[i]);
-                    sub_offset = i + t - R; 
-                    found = true;
-                    break;
+                    int curr = i + k; // 当前索引为 i + k
+
+                    // 如果撞到了最高峰或者越界，立刻停止
+                    if (curr + 1 >= search_len || curr >= max_idx)
+                    {
+                        break;
+                    }
+                    
+                    float grad = signal[curr+1] - signal[curr]; // 当前索引处的梯度
+                    
+                    // 一旦梯度不再陡峭（开始变缓），果断踩死刹车！拒绝被内部过曝吸引！
+                    if (grad <= max_grad * 0.9) break;
+                    
+                    // 梯度还在变得更陡，这就是真实的物理边缘！
+                    max_grad = grad;
+                    best_i = curr;
                 }
-            }
-        }
-        else 
-        {
-            // 下端点：图像下方是外侧(大索引)。
-            // 【由外向内推】：从 search_len-1 往中间走(倒序)，寻找首次跨越阈值的点
-            for (int i = search_len - 1; i > 0; i--)
-            {
-                if (signal[i] <= thresh && signal[i-1] > thresh)
-                {
-                    float t = (thresh - signal[i]) / (signal[i-1] - signal[i]);
-                    sub_offset = i - t - R; 
-                    found = true;
-                    break;
-                }
+                if (best_i != i) std::cout << "index 从 " << i << " 修改成 " << best_i << std::endl;
+
+                // 线性插值精确定位
+                float t = (thresh - signal[best_i]) / (signal[best_i+1] - signal[best_i]);
+                std::cout << "best_i_index = " << best_i << " t: " << t << std::endl;
+                
+                // 相对 project_pt 的标量偏移：索引 best_i 对应的 step 是 best_i - R
+                sub_offset = best_i + t - R; 
+                found = true;
+                break;
             }
         }
     }
 
-    // 安全校验：如果没有找到，或者偏移量离谱，退回投影中心
     if (!found) 
     {
         sub_offset = 0.0f; 
     }
 
-    // 将亚像素步进映射回去，得到最终优化端点位置
+    // 最后，将标量偏移乘上统一的向内方向向量，加回原点
     float final_step = sub_offset * 1.0f;
-    return project_pt + final_step * v;
+    return project_pt + final_step * scan_dir;
 }
 
 

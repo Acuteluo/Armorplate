@@ -227,7 +227,7 @@ cv::Mat YoloArmor::DrawMagnifiedROI(const cv::Mat& original_img,
                                     int scale)
 {
     // 1. 根据 YOLO 框扩大 ROI 范围 (扩大 15 像素以容纳周围背景)
-    int expand = 15;
+    int expand = 10;
     cv::Rect roi = box_;
     roi.x -= expand; 
     roi.y -= expand;
@@ -251,14 +251,44 @@ cv::Mat YoloArmor::DrawMagnifiedROI(const cv::Mat& original_img,
     cv::resize(cropped, magnified, cv::Size(), scale, scale, cv::INTER_NEAREST);
 
     // 绘制灰色细线网格，清晰看到原图的每一个像素块
-    for (int i = 0; i <= magnified.cols; i += scale) 
+    // for (int i = 0; i <= magnified.cols; i += scale) 
+    // {
+    //     cv::line(magnified, cv::Point(i, 0), cv::Point(i, magnified.rows), cv::Scalar(80, 80, 80), 1);
+    // }
+    // for (int i = 0; i <= magnified.rows; i += scale) 
+    // {
+    //     cv::line(magnified, cv::Point(0, i), cv::Point(magnified.cols, i), cv::Scalar(80, 80, 80), 1);
+    // }
+
+
+    // B. 绘制红色整数坐标轴，并标上数字 (代表 x.0 和 y.0 的像素中心位置)
+    for (int i = 0; i < roi.width; i++) 
     {
-        cv::line(magnified, cv::Point(i, 0), cv::Point(i, magnified.rows), cv::Scalar(50, 50, 50), 1);
+        // 像素块的正中心在缩放图中的确切位置
+        int x_center = i * scale + scale / 2;
+        int real_x = roi.x + i;
+        
+        // 垂直红色指示线（表示整数 x 轴）
+        cv::line(magnified, cv::Point(x_center, 0), cv::Point(x_center, magnified.rows), cv::Scalar(0, 0, 180), 1);
+        
+        // 在顶部写上真实的 X 坐标
+        cv::putText(magnified, std::to_string(real_x), cv::Point(x_center - 10, 15), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 200), 1);
     }
-    for (int i = 0; i <= magnified.rows; i += scale) 
+    
+    for (int i = 0; i < roi.height; i++) 
     {
-        cv::line(magnified, cv::Point(0, i), cv::Point(magnified.cols, i), cv::Scalar(50, 50, 50), 1);
+        int y_center = i * scale + scale / 2;
+        int real_y = roi.y + i;
+        
+        // 水平红色指示线（表示整数 y 轴）
+        cv::line(magnified, cv::Point(0, y_center), cv::Point(magnified.cols, y_center), cv::Scalar(0, 0, 180), 1);
+        
+        // 在左侧写上真实的 Y 坐标
+        cv::putText(magnified, std::to_string(real_y), cv::Point(5, y_center + 4), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 200), 1);
     }
+
 
     // 内部 Lambda 工具：将原图亚像素坐标映射到放大图的整型坐标上
     // opencv定义是像素块中心是整数坐标。但为了符合肉眼直觉，向右偏移 0.5 像素，这样边界线是整数坐标，像素块中心是.5坐标
@@ -303,30 +333,30 @@ cv::Mat YoloArmor::DrawMagnifiedROI(const cv::Mat& original_img,
     if(debug_pts.size() == 6) 
     {
         // 左灯条边缘与中心：左粉，右橙，中白
-        for(auto& p : debug_pts[0]) draw_cross(p, cv::Scalar(255, 0, 255), scale/4); 
-        for(auto& p : debug_pts[1]) draw_cross(p, cv::Scalar(0, 165, 255), scale/4); 
-        for(auto& p : debug_pts[2]) draw_cross(p, cv::Scalar(255, 255, 255), scale/4); 
+        for(auto& p : debug_pts[0]) draw_cross(p, cv::Scalar(255, 0, 255), scale/5); 
+        for(auto& p : debug_pts[1]) draw_cross(p, cv::Scalar(0, 165, 255), scale/5); 
+        for(auto& p : debug_pts[2]) draw_cross(p, cv::Scalar(255, 255, 255), scale/5); 
         
         // 右灯条边缘与中心：左粉，右橙，中白
-        for(auto& p : debug_pts[3]) draw_cross(p, cv::Scalar(255, 0, 255), scale/4); 
-        for(auto& p : debug_pts[4]) draw_cross(p, cv::Scalar(0, 165, 255), scale/4); 
-        for(auto& p : debug_pts[5]) draw_cross(p, cv::Scalar(255, 255, 255), scale/4); 
+        for(auto& p : debug_pts[3]) draw_cross(p, cv::Scalar(255, 0, 255), scale/5); 
+        for(auto& p : debug_pts[4]) draw_cross(p, cv::Scalar(0, 165, 255), scale/5); 
+        for(auto& p : debug_pts[5]) draw_cross(p, cv::Scalar(255, 255, 255), scale/5); 
     }
     // ==============================================================
 
 
-    // 5. 画出原始的 YOLO 粗糙角点 (蓝色实心大圆)
+    // 5. 画出原始的 YOLO 粗糙角点 (蓝色实心圆)
     for (const auto& pt : corners_) 
     {
-        cv::circle(magnified, map_pt(pt), scale / 2, cv::Scalar(255, 0, 0), cv::FILLED);
+        cv::circle(magnified, map_pt(pt), scale / 3.5, cv::Scalar(255, 0, 0), cv::FILLED);
     }
 
 
-    // 6. 画出我们的高精度亚像素修正角点 (绿色实心小圆)
+    // 6. 画出我们的高精度亚像素修正角点 (绿色实心圆)
     // 你会清楚地看到绿点偏离蓝点，稳稳地落在黄色直线上，并且精准卡在灯条尽头的网格内！
     for (const auto& pt : fixed_corners_) 
     {
-        cv::circle(magnified, map_pt(pt), scale / 3, cv::Scalar(0, 255, 0), cv::FILLED);
+        cv::circle(magnified, map_pt(pt), scale / 3.5, cv::Scalar(0, 255, 0), cv::FILLED);
     }
         
 
