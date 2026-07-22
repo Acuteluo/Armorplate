@@ -39,6 +39,9 @@ public:
 
     double yaw_angle_ = 0.00;          // 优化得到的最好的 欧拉角 yaw（度）
 
+    std::vector<cv::Point3f> vertice_world_; // 装甲板在 FLU 系下的 3D 物理点（定义点）
+    std::vector<cv::Point3f> vertice_cv_;    // 转换到 OpenCV 相机系下的 3D 物理点（定义点）
+
 
     // --- 相机内参 ---
 
@@ -51,8 +54,8 @@ public:
     // 根据 YOLO 判断的大/小板设置装甲板四个角点的坐标，并将 FLU 系的点转换到 OpenCV 系下供 PnP 使用
     void SetArmorplateSize();
 
-    // 原始的执行 PNP IPPE 解算，并完成逆向基变换 (OpenCV -> FLU)
-    void PNP();
+    // 执行 PNP IPPE 解算，并完成逆向基变换 (OpenCV -> FLU)，选择是否使用修正后的点计算
+    void PNP(bool use_fixed_corners = false);
 
     // 计算重投影误差 (RMSE)，传入 FLU 坐标系下的平移向量和旋转矩阵
     double CalculateReprojectionError(const Eigen::Vector3d& t_flu, const Eigen::Matrix3d& R_flu);
@@ -71,14 +74,18 @@ public:
     // 打印调试日志
     void PrintDebugLog(bool is_debug);
 
-private:
-
-    std::vector<cv::Point3f> vertice_world_; // 装甲板在 FLU 系下的 3D 物理点（定义点）
-    std::vector<cv::Point3f> vertice_cv_;    // 转换到 OpenCV 相机系下的 3D 物理点（定义点）
-    cv::Mat r_cv_, t_cv_;                    // OpenCV 算出来的原始旋转平移向量
-    Eigen::Matrix3d P_;                      // 坐标系转换矩阵 (FLU -> OpenCV)
     double reprojection_error_ = 0.0;        // 重投影误差（RMSE 均方根误差）
 
+private:
+
+    // --- 核心优化器：Levenberg-Marquardt ---
+    void OptimizePoseLM();
+    Eigen::VectorXd CalculateResiduals(const Eigen::VectorXd& state);
+    Eigen::MatrixXd CalculateJacobian(const Eigen::VectorXd& state);
+
+    cv::Mat r_cv_, t_cv_;                    // OpenCV 算出来的原始旋转平移向量
+    Eigen::Matrix3d P_;                      // 坐标系转换矩阵 (FLU -> OpenCV)
+    
     bool show_logger_pnp_ = false;           // 是否打印 调试日志
 };
 

@@ -45,6 +45,7 @@ add_executable(optimizer
     src/tools/logger.cpp
     src/tools/math_utils.cpp
     src/armor_corner_refiner.cpp
+    src/sliding_window_ba.cpp
 )
 
 # 链接库

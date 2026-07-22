@@ -7,6 +7,7 @@
 #include <chrono>
 #include <vector>
 #include <string>
+#include <map>
 
 // --- rosbag2_cpp 解析依赖 ---
 #include <rosbag2_cpp/reader.hpp>
@@ -19,11 +20,14 @@
 #include "yolo/yolo_detector.hpp"
 #include "yolo/yolo_armor.hpp"
 #include "armor_corner_refiner.hpp"
+#include "sliding_window_ba.hpp"
 
 // ================= 全局共享数据与锁 =================
 struct SharedData 
 {
     cv::Mat current_frame;         // 拉流线程写入：刚从 rosbag 取出的原图
+    long long hardware_timestamp_ns = 0; // 拉流线程写入：当前帧的硬件时间戳
+
     cv::Mat display_frame;         // 视觉线程写入：画好框和打印好数据的渲染图
     cv::Mat refined_frame;         // 视觉线程写入：经过亚像素角点修正的放大图
     bool frame_updated = false;    // 标志位：是否有新图
@@ -180,6 +184,7 @@ void RosbagReadThread(const std::string& bag_path, const std::string& topic_name
 
                 // 塞入新图，拉响标志位
                 g_data.current_frame = frame_bgr.clone();
+                g_data.hardware_timestamp_ns = bag_message->time_stamp; // rosbag 消息自带的绝对时间戳，单位 ns
                 g_data.frame_updated = true;
             }
             // 唤醒处于休眠等待状态的视觉线程去干活
@@ -193,15 +198,36 @@ void RosbagReadThread(const std::string& bag_path, const std::string& topic_name
 }
 
 
+// =========================================================================================
+// 【新增】：追踪器上下文结构体，解绑 obj.number 唯一性！
+// =========================================================================================
+struct TrackerContext 
+{
+    int internal_id;            // 系统分配的唯一独立 ID
+    int armor_number;           // 物理贴纸数字 (如 1)
+    SlidingWindowBA ba;         // 专属滑动窗口
+    double last_timestamp_sec;  // 最后活跃时间
+};
+
+
 // ================= 子线程 B：视觉处理 (消费者) =================
 void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D) 
 {
     cv::Mat process_frame;
-    int frame_count = 0;
     auto fps_start_time = std::chrono::steady_clock::now();
 
     // 【新增】：实例化角点精化器
     ArmorCornerRefiner corner_refiner;
+
+    // 【核心改进】：改用带有独立上下文的追踪器列表，防同号碰撞
+    std::vector<TrackerContext> trackers;
+    int next_internal_id = 0; // 自增追踪器分配 ID
+    
+    long long process_timestamp_ns = 0; // 取出当前帧的硬件时间戳
+    long long t0_hardware_ns = -1; // 记录启动时刻，用于时间戳相对化归一化，防止 double 浮点数丢失微秒级精度
+
+    // 累加帧数，每x秒清零，用于统计当前fps
+    int frame_count = 0;
 
     while (g_running) 
     {
@@ -214,6 +240,7 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
             
             // 深拷贝原图，防止在画框时污染底层数据
             process_frame = g_data.current_frame.clone();
+            process_timestamp_ns = g_data.hardware_timestamp_ns; // 获取该帧绝对物理时间，单位 ns
             g_data.frame_updated = false; // 重置标志位
         }
         
@@ -225,10 +252,16 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
             cv::Mat img_show = {};
             cv::Mat img_refined = {};
 
+            if (t0_hardware_ns == -1) t0_hardware_ns = process_timestamp_ns; // 如果是首帧，则保存物理时间戳作为起始时间
+            double current_timestamp_sec = static_cast<double>(process_timestamp_ns - t0_hardware_ns) * 1e-9; // 相对时间戳，单位 s，保证精度
+
             // 2. YOLO 推理 (计时开始)
             auto t0 = std::chrono::steady_clock::now();
             std::vector<YoloObject> detections = detector->Detect(process_frame, ENEMY_COLOR);
             auto t1 = std::chrono::steady_clock::now();
+
+            // 【新增】：记录本帧被观测到的目标 ID，用于清理过期追踪器
+            std::vector<int> active_ids_this_frame;
             
             // 3. 姿态解算：PnP 与 网格搜索姿态优化
             for (auto& obj : detections) 
@@ -248,21 +281,110 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
                 armor.SetArmorplateSize();
                 armor.PrintDebugLog(false); // 关闭刷屏打印
                 
+                // --- 开始 ---
+
+                // 用来存储原始 xyz yaw 的
+                Eigen::Vector3d raw_pos = Eigen::Vector3d::Zero();
+                double raw_yaw = 0.0;
+                
+                // 用来存储lm后的 xyz yaw 的
+                Eigen::Vector3d lm_pos = Eigen::Vector3d::Zero();
+                double lm_yaw = 0.0;
+
+                // 阶段 1：原始 6-DoF PnP 解算 (无约束)
                 // 对原始点，执行解算 PNP IPPE
                 armor.PNP(); 
-
-                // 画出解算结果
                 if (armor.pnp_success_) 
                 {
-                    armor.CalculateReprojectionError(armor.t_flu_, armor.R_flu_); // 计算原始 pnp 的重投影误差
-                    
-                    // 亚像素图，放大 40 倍！
-                    img_refined = armor.DrawMagnifiedROI(process_frame, left_middle_line, right_middle_line, corner_refiner.GetDebugPoints(), 40);
-                
-                    img_show = armor.DrawAndPrintInfo(process_frame, "complex");
+                    raw_pos = armor.t_flu_;
+                    raw_yaw = armor.yaw_angle_;
                 }
 
+                // 阶段 2：单帧 4-DoF LM 约束优化，对修正点先执行解算 PNP IPPE 后单帧 LM
+                armor.PNP(true); 
+                if (armor.pnp_success_) 
+                {
+                    lm_pos = armor.t_flu_;
+                    lm_yaw = armor.yaw_angle_;
+
+                    // ====================================================================
+                    // 阶段 3：时空联合 8-DoF 滑动窗口 BA 优化
+                    // 【核心跃迁：基于 3D 空间距离的数据关联 (Data Association)】
+                    // ====================================================================
                     
+                    Eigen::Vector3d current_pos = armor.t_flu_;
+                    int best_match_idx = -1;
+                    double min_dist = 0.4; // 关联容差：前后帧最大物理位移 40 厘米
+
+                    for (size_t i = 0; i < trackers.size(); i++) 
+                    {
+                        if (trackers[i].armor_number != obj.number) continue; // 数字必须匹配
+                        
+                        // 【致命Bug修复】：改为 GetLastPosition() 防止第1帧时态 0 坐标污染欧氏距离！
+                        Eigen::Vector3d last_pos = trackers[i].ba.GetLastPosition();
+                        double dist = (current_pos - last_pos).norm();
+                        
+                        if (dist < min_dist) 
+                        {
+                            min_dist = dist;
+                            best_match_idx = i;
+                        }
+                    }
+
+                    // 如果没找到匹配的，说明是另一块同号装甲板，或者新目标
+                    if (best_match_idx == -1) 
+                    {
+                        TrackerContext new_ctx;
+                        new_ctx.internal_id = next_internal_id++;
+                        new_ctx.armor_number = obj.number;
+                        new_ctx.ba = SlidingWindowBA(5, K, D);
+                        new_ctx.last_timestamp_sec = current_timestamp_sec;
+                        
+                        trackers.push_back(new_ctx);
+                        best_match_idx = trackers.size() - 1;
+                    }
+
+                    auto& tracker_ctx = trackers[best_match_idx];
+
+                    // 填入观测：相对时间戳（单位 s），亚像素角点，真实物理尺寸，LM优化的初值
+                    tracker_ctx.ba.AddObservation(current_timestamp_sec, 
+                                                  obj.pts,                     
+                                                  armor.vertice_cv_,
+                                                  armor.t_flu_,                
+                                                  tools::deg2rad(armor.yaw_angle_)); 
+
+                    tracker_ctx.last_timestamp_sec = current_timestamp_sec;
+
+                    // 把检测到的目标对应的 内部分配ID 推进活跃列表，防止被清理
+                    active_ids_this_frame.push_back(tracker_ctx.internal_id);
+
+                    // 执行 8-DoF 联合时序优化！
+                    if (tracker_ctx.ba.Optimize()) 
+                    {
+                        // 拿到最后 时序BA 优化的结果
+                        Eigen::Vector3d smooth_pos = tracker_ctx.ba.GetCurrentPosition();
+                        double smooth_yaw = tools::rad2deg(tracker_ctx.ba.GetCurrentYaw());
+                        
+                        Eigen::Vector3d vel = tracker_ctx.ba.GetVelocity();
+                        double yaw_vel = tools::rad2deg(tracker_ctx.ba.GetYawVelocity());
+
+                        // 【终极照妖镜】：三阶段数据对比大阅兵
+                        // 【全景照妖镜】：X(前/深度) Y(左) Z(上) Yaw(偏航) 全面打印
+                        LOG_INFO("【物理贴纸: {} | 系统独立追踪器 ID: {}】", obj.number, tracker_ctx.internal_id);
+                        LOG_INFO(" -> [X轴 深度(前)] 原始: {:.3f}m | 单帧LM: {:.3f}m | 时序BA: {:.3f}m", raw_pos(0), lm_pos(0), smooth_pos(0));
+                        LOG_INFO(" -> [Y轴 横向(左)] 原始: {:.3f}m | 单帧LM: {:.3f}m | 时序BA: {:.3f}m", raw_pos(1), lm_pos(1), smooth_pos(1));
+                        LOG_INFO(" -> [Z轴 高度(上)] 原始: {:.3f}m | 单帧LM: {:.3f}m | 时序BA: {:.3f}m", raw_pos(2), lm_pos(2), smooth_pos(2));
+                        LOG_INFO(" -> [Yaw  偏航角] 原始: {:>6.2f}° | 单帧LM: {:>6.2f}° | 时序BA: {:>6.2f}°", raw_yaw, lm_yaw, smooth_yaw);
+                        LOG_INFO(" -> [物理 3D 速度] Vx(前): {:.2f} m/s | Vy(左): {:.2f} m/s | Vz(上): {:.2f} m/s", vel(0), vel(1), vel(2));
+                        LOG_INFO(" -> [自旋  角速度] Vyaw: {:.2f} °/s", yaw_vel);
+                        LOG_INFO("---------------------------------------------------------");
+                    }
+                }
+
+                // 亚像素图，放大 40 倍！
+                img_refined = armor.DrawMagnifiedROI(process_frame, left_middle_line, right_middle_line, corner_refiner.GetDebugPoints(), 40);
+                
+                img_show = armor.DrawAndPrintInfo(process_frame, "complex");
             }
             auto t2 = std::chrono::steady_clock::now();
 
@@ -273,11 +395,29 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
                 g_data.refined_frame = img_refined.clone();
             }
 
+            // 【新增】：清道夫机制！抹杀一切超过 0.5 秒没有更新的“幽灵追踪器”！
+            for (auto it = trackers.begin(); it != trackers.end(); ) 
+            {
+                // 如果当前帧没有检测到这个 ID，且它距离最后一次更新的时间超过了 0.5s，直接删除！
+                bool is_active_now = std::find(active_ids_this_frame.begin(), active_ids_this_frame.end(), it->internal_id) != active_ids_this_frame.end();
+                
+                // 注意：必须给 SlidingWindowBA 增加一个 GetLastTimestamp() 接口
+                if (!is_active_now && (current_timestamp_sec - it->last_timestamp_sec > 0.5)) 
+                {
+                    LOG_WARN("[Tracker] 系统独立追踪器 ID: {} (贴纸 {}) 丢失超过 0.5s, 已清除其时序记忆！", it->internal_id, it->armor_number);
+                    it = trackers.erase(it);
+                }
+                else 
+                {
+                    ++it;
+                }
+            }
+
             // 5. 耗时与 FPS 统计 (每隔 1 秒打印一次，防止刷屏)
             double nn_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             double pnp_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
             
-            ++frame_count;
+            ++frame_count; // 用于计算 FPS 的帧数 +1
             auto fps_current_time = std::chrono::steady_clock::now();
             double elapsed_seconds = std::chrono::duration<double>(fps_current_time - fps_start_time).count();
             
@@ -290,9 +430,10 @@ void VisionThread(YoloDetector* detector, const cv::Mat& K, const cv::Mat& D)
                 fps_start_time = fps_current_time;
             }
 
-            // 【新增 可逆 控制速度】：真正的全局控速阀门！
-            // 让视觉线程处理完后休息 30ms。由于 A 和 B 是锁步的，这会强制让整个 Rosbag 的读取速度降到约 30fps，且绝不漏帧！
-            std::this_thread::sleep_for(std::chrono::milliseconds(500)); 
+            // 现在我们使用了硬件时间戳，你可以任意更改这个 sleep 时间。
+            // 例如：改成 5ms 可以全速压榨 CPU 播放；改成 2000ms 可以两秒放一帧，肉眼仔细观察角点变化。
+            // 无论怎么改，时序 BA 算出的 3D 速度绝对不会发生任何畸变！
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 }
@@ -370,7 +511,7 @@ int main(int argc, char** argv)
             char key = (char)cv::waitKey(1); 
             if (key == 27 || key == 'q' || key == 'Q') 
             {
-                LOG_WARN("收到退出指令...");
+                LOG_WARN("收到退出指令...\n");
                 g_running = false;
                 g_cv.notify_all(); // 叫醒所有还在 wait 的线程
                 break;

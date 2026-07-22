@@ -65,17 +65,20 @@ void YoloArmor::SetArmorplateSize()
 
 
 
-void YoloArmor::PNP() 
+void YoloArmor::PNP(bool use_fixed_corners) 
 {
+    std::vector<cv::Point2f> corners_for_pnp;
+    corners_for_pnp = use_fixed_corners ? fixed_corners_ : corners_;
+
     // 如果传入的角点数量不对，直接标记失败并返回
-    if (corners_.size() != 4 || vertice_cv_.size() != 4) 
+    if (corners_for_pnp.size() != 4 || vertice_cv_.size() != 4) 
     {
         pnp_success_ = false;
         return;
     }
 
     // 1. 执行 OpenCV 的 solvePnP，用 IPPE 方法
-    pnp_success_ = cv::solvePnP(vertice_cv_, corners_, K_, D_, r_cv_, t_cv_, false, cv::SOLVEPNP_IPPE);
+    pnp_success_ = cv::solvePnP(vertice_cv_, corners_for_pnp, K_, D_, r_cv_, t_cv_, false, cv::SOLVEPNP_IPPE);
 
     if (!pnp_success_) 
     {
@@ -108,14 +111,222 @@ void YoloArmor::PNP()
     // 还原回 FLU 右手系，保持纯原始的 6-DoF 状态作为 Baseline
     R_flu_ = P_.transpose() * R_cv_eigen * P_; // R_flu_ = P^(-1) * R_cv * P
 
-    // 从粗糙的 6-DoF 旋转矩阵中提取相对 Yaw 角 (仅供参考和打印)
+    if (use_fixed_corners)
+    {
+        // =========================================================================
+        // 【核心架构加入】：执行 4-DoF Levenberg-Marquardt 非线性优化
+        // 目的：打破 Z 和 Yaw 的耦合，并约束 Roll=0, Pitch=15
+        // =========================================================================
+        OptimizePoseLM();
+
+        // 优化完成后，重新提取最终的距离和角度供外层使用
+        t_distance_ = t_flu_.norm();
+    }
+
+    // 从旋转矩阵中提取相对 Yaw 角 (仅供参考和打印)
     yaw_angle_ = tools::rad2deg(std::atan2(R_flu_(1, 0), R_flu_(0, 0)));
 
     if (show_logger_pnp_) 
     {
-        LOG_DEBUG("[PNP] 原始PnP计算完毕, X: {:.2f}, Y: {:.2f}, Z: {:.2f}, Yaw: {:.2f}°", t_flu_(0), t_flu_(1), t_flu_(2), yaw_angle_);
+        if (use_fixed_corners) LOG_DEBUG("[PNP] 修正后的 PnP计算完毕, X: {:.2f}, Y: {:.2f}, Z: {:.2f}, Yaw: {:.2f}°", t_flu_(0), t_flu_(1), t_flu_(2), yaw_angle_);
+        else LOG_DEBUG("[PNP] 原始的 PnP计算完毕, X: {:.2f}, Y: {:.2f}, Z: {:.2f}, Yaw: {:.2f}°", t_flu_(0), t_flu_(1), t_flu_(2), yaw_angle_);
     }
 }
+
+
+
+
+// =============================================================================
+// 以下是为时序 BA 铺垫的核心：4-DoF 非线性优化器 (Levenberg-Marquardt)
+// =============================================================================
+
+// 计算残差 (观测 2D 点 - 投影 2D 点)
+Eigen::VectorXd YoloArmor::CalculateResiduals(const Eigen::VectorXd& state)
+{
+    // 状态向量 state: [X, Y, Z, Yaw]
+    double tx = state(0);
+    double ty = state(1);
+    double tz = state(2);
+    double yaw = state(3);
+    
+    // 物理约束先验：装甲板不可侧倾，且固定有 15度 仰角
+    double fixed_pitch = tools::deg2rad(15.0); 
+    double fixed_roll = 0.0;
+
+    // 构建 FLU 旋转矩阵
+    Eigen::AngleAxisd yawAngle(yaw, Eigen::Vector3d::UnitZ());
+    Eigen::AngleAxisd pitchAngle(fixed_pitch, Eigen::Vector3d::UnitY());
+    Eigen::AngleAxisd rollAngle(fixed_roll, Eigen::Vector3d::UnitX());
+    Eigen::Matrix3d R_flu = (yawAngle * pitchAngle * rollAngle).toRotationMatrix();
+    Eigen::Vector3d t_flu(tx, ty, tz);
+
+    // 转换到相机系
+    Eigen::Matrix3d R_cv = P_ * R_flu * P_.transpose();
+    Eigen::Vector3d t_cv = P_ * t_flu;
+
+    cv::Mat R_cv_mat(3, 3, CV_64F);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            R_cv_mat.at<double>(i, j) = R_cv(i, j);
+
+    cv::Mat rvec_test, tvec_test;
+    cv::Rodrigues(R_cv_mat, rvec_test);
+    tvec_test = (cv::Mat_<double>(3, 1) << t_cv(0), t_cv(1), t_cv(2));
+
+    // 执行重投影
+    std::vector<cv::Point2f> projected_points;
+    cv::projectPoints(vertice_cv_, rvec_test, tvec_test, K_, D_, projected_points);
+
+    // 构建 8 维残差向量 [u0_err, v0_err, u1_err, v1_err ...]
+    Eigen::VectorXd residuals(8);
+    for (int i = 0; i < 4; i++) 
+    {
+        // 必须使用精化后的高精度角点 fixed_corners_
+        residuals(i * 2)     = fixed_corners_[i].x - projected_points[i].x; 
+        residuals(i * 2 + 1) = fixed_corners_[i].y - projected_points[i].y; 
+    }
+
+    return residuals;
+}
+
+// 数值微分计算雅可比矩阵
+Eigen::MatrixXd YoloArmor::CalculateJacobian(const Eigen::VectorXd& state)
+{
+    Eigen::MatrixXd J(8, 4);
+    
+    // 扰动量 (平移 1cm，角度 0.001 弧度)
+    double delta_t = 0.01; 
+    double delta_r = 0.001; 
+    Eigen::VectorXd deltas(4);
+    deltas << delta_t, delta_t, delta_t, delta_r;
+
+    Eigen::VectorXd res_base = CalculateResiduals(state);
+
+    for (int j = 0; j < 4; j++)
+    {
+        Eigen::VectorXd state_plus = state;
+        state_plus(j) += deltas(j);
+        Eigen::VectorXd res_plus = CalculateResiduals(state_plus);
+        J.col(j) = (res_plus - res_base) / deltas(j);
+    }
+    return J;
+}
+
+void YoloArmor::OptimizePoseLM()
+{
+    // 1. 初始化状态量 [X, Y, Z, Yaw]
+    Eigen::VectorXd state(4);
+    double initial_yaw = std::atan2(R_flu_(1, 0), R_flu_(0, 0)); 
+    state << t_flu_(0), t_flu_(1), t_flu_(2), initial_yaw;
+
+    int max_iterations = 20;
+    double lambda = 1.0;      // LM 阻尼系数初始值
+    double nu = 2.0;          // Nielsen 策略：拒绝惩罚倍数因子
+    double epsilon = 1e-6;    // 收敛精度提升到 1e-6
+
+    Eigen::VectorXd current_res = CalculateResiduals(state);
+    double current_error = current_res.squaredNorm();
+
+    // 2. LM 迭代主循环
+    for (int iter = 0; iter < max_iterations; iter++)
+    {
+        Eigen::MatrixXd J = CalculateJacobian(state);
+        Eigen::MatrixXd H = J.transpose() * J;        // 算 Hessian 矩阵
+        Eigen::VectorXd g = -J.transpose() * current_res; // 算梯度
+
+        // 梯度无穷小判定：已经陷入极其平坦的谷底，直接收敛
+        if (g.lpNorm<Eigen::Infinity>() < 1e-8) 
+        {
+            break;
+        }
+
+        // Levenberg-Marquardt 阻尼方程： (H + lambda * I) * dx = g
+        // 这一步等价于你在周报中提到的“监测 SVD 并自适应阻尼”。
+        // 当 H 接近奇异（Z轴难以观测）时，lambda*I 强制让其可逆，防止步长爆炸。
+        Eigen::MatrixXd H_lm = H + lambda * Eigen::MatrixXd::Identity(4, 4);
+        
+        // 使用 LDLT 分解求解，安全稳定
+        Eigen::VectorXd dx = H_lm.ldlt().solve(g); 
+
+        if (std::isnan(dx(0))) 
+        {
+            break; // 矩阵病态保护
+        }
+
+        if (dx.norm() < epsilon) 
+        {
+            break; // 已收敛
+        }
+
+        // -------------------------------------------------------------
+        // 步长防爆裁剪 (Step Clipping)
+        // 绝对不允许优化器单步走火入魔，限制最大步长
+        // -------------------------------------------------------------
+        double trans_step = dx.head<3>().norm();
+        if (trans_step > 0.1) // 单步平移不得超过 10 厘米
+        {
+            dx.head<3>() *= 0.1 / trans_step;
+        }
+        if (std::abs(dx(3)) > 0.1) // 单步 Yaw角 旋转最大 5.7度 (0.1 rad)
+        {
+            dx(3) = (dx(3) > 0) ? 0.1 : -0.1;
+        }
+
+        // 步长尝试
+        Eigen::VectorXd new_state = state + dx;
+        tools::limit_rad_inplace(new_state(3)); // 约束 Yaw 在 -PI 到 PI
+
+        Eigen::VectorXd new_res = CalculateResiduals(new_state);
+        double new_error = new_res.squaredNorm();
+
+        // 核心：Nielsen 策略的增益比 (Gain Ratio) 计算
+        // predicted_reduction 是高斯牛顿模型预测的误差下降量
+        double predicted_reduction = dx.dot(lambda * dx + g);
+        double rho = (current_error - new_error) / (predicted_reduction + 1e-10); // 防止除 0
+
+        if (rho > 0) 
+        {
+            // Step Accepted (误差确实下降了)
+            state = new_state;
+            current_res = new_res;
+            current_error = new_error;
+            
+            // 如果 rho 很大 (接近1)，说明模型非常准确，阻尼急剧减小 (最少降至 1/3)
+            // 如果 rho 很小，说明地形坑洼，稍微减小阻尼
+            double temp = 1.0 - std::pow(2.0 * rho - 1.0, 3);
+            lambda *= std::max(1.0 / 3.0, temp);
+            nu = 2.0; // 重置惩罚因子
+        } 
+        else 
+        {
+            // Step Rejected (误差反而上升了，遇到了极其恶劣的非线性区)
+            // 采用倍增惩罚策略，迅速退化为保守的梯度下降法
+            lambda *= nu;
+            nu *= 2.0; 
+        }
+    }
+
+    // 3. 将优化结果写回成员变量
+    t_flu_(0) = state(0);
+    t_flu_(1) = state(1);
+    t_flu_(2) = state(2);
+    
+    // 重建被强约束纠正后的旋转矩阵
+    double fixed_pitch = tools::deg2rad(15.0); 
+    Eigen::AngleAxisd yawAngle(state(3), Eigen::Vector3d::UnitZ());
+    Eigen::AngleAxisd pitchAngle(fixed_pitch, Eigen::Vector3d::UnitY());
+    Eigen::AngleAxisd rollAngle(0.0, Eigen::Vector3d::UnitX());
+    R_flu_ = (yawAngle * pitchAngle * rollAngle).toRotationMatrix(); 
+
+    // 计算最终 RMSE
+    reprojection_error_ = std::sqrt(current_error / 4.0);
+}
+
+
+
+
+
+
 
 
 
